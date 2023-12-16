@@ -1,6 +1,6 @@
 For general questions about this library, see the "Stanford Compression Library" section at the bottom.  
 
-For my contribution, see alias_rANS.py, markov_rANS.py, and rANS.py in the scl/compressors folder.  
+For my contribution, see alias_rANS.py, markov_rANS.py, and rANS.py in the scl/compressors folder.   
 I implemented alias_rANS.py and markov_rANS.py myself and tested the speed/compression performance using the data found in the project_data folder as well as the test_markov_rANS_coding() function.  
 
 
@@ -8,7 +8,7 @@ To replicate my code/results, please see the run_markov_tests.py file, the test_
 Note, I am using a 2020 Intel Macbook with an i5 processor. You might get different results running on your computer.  
 
 To view a slideshow I made on Alias rANS: https://docs.google.com/presentation/d/14kAA1SqGkA77qmR10r9umzMP1Gf8bqrwxSY_FLpoDxQ/edit?usp=sharing  
-To view a project result on my implementations: https://www.overleaf.com/read/xnfdmfnfyskb#8ef1ac
+To view a project report on my implementations: https://www.overleaf.com/read/xnfdmfnfyskb#8ef1ac
 
 - Avash Shrestha
 
