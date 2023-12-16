@@ -1,64 +1,3 @@
-"""Streaming rANS (range Asymmetric Numeral Systems) implementation
-
-NOTE: Detailed algorithm description and discussion is on the wiki page:
-https://github.com/kedartatwawadi/stanford_compression_library/wiki/Asymmetric-Numeral-Systems
-
-## Core idea
-- the theoretical rANS Encoder maintains an integer `state` 
-- For each symbol s, the state is updated by calling: 
-    ```python
-    # encode step
-    state = rans_base_encode_step(s, state)
-    ```
-    the decoder does the reverse by decoding the s and retrieving the prev state
-    ```python
-    # decode step
-    s, state = rans_base_decode_step(state)
-    ```
-- In the theoretical rANS version, the state keeps on increasing every time we call `rans_base_encode_step`
-  To make this practical, the rANS encoder ensures that after each encode step, the `state` lies in the acceptable range
-  `[L, H]`, where `L,H` are predefined interval values.
-
-  ```
-  state lies in [L, H], after every encode step
-  ```
-  To ensure this happens the encoder shrinks the `state` by streaming out its lower bits, *before* encoding each symbol. 
-  This logic is implemented in the function `shrink_state`. Thus, the full encoding step for one symbol is as follows:
-
-  ```python
-    ## Encoding one symbol
-    # output bits to the stream to bring the state in the range for the next encoding
-        state, out_bits = self.shrink_state(state, s)
-        encoded_bitarray = out_bits + encoded_bitarray
-
-    # core encoding step
-    state = self.rans_base_encode_step(s, state)
-  ```
-
-  The decoder does the reverse operation of `expand_state` where, after decoding a symbol, it reads in the a few bits to
-  re-map and expand the state to lie within the acceptable range [L, H]
-  Note that `shrink_state` and `expand_state` are inverses of each other
-
-  Thus, the  full decoding step 
-  ```python
-    # base rANS decoding step
-    s, state = self.rans_base_decode_step(state)
-
-    # remap the state into the acceptable range
-    state, num_bits_used_by_expand_state = self.expand_state(state, encoded_bitarray)
-  ```
-- For completeness: the acceptable range `[L, H]` are given by:
-  L = RANGE_FACTOR*total_freq
-  H = (2**NUM_BITS_OUT)*RANGE_FACTOR*total_freq - 1)
-  Why specifically these values? Look at the *Streaming-rANS* section on https://kedartatwawadi.github.io/post--ANS/
-
-
-## References
-1. Original Asymmetric Numeral Systems paper:  https://arxiv.org/abs/0902.0271
-2. https://github.com/kedartatwawadi/stanford_compression_library/wiki/Asymmetric-Numeral-Systems
-More references in the wiki article
-"""
-
 from dataclasses import dataclass
 import numpy as np
 from typing import Tuple, Any, List
@@ -75,7 +14,7 @@ from scl.utils.test_utils import get_random_data_block, try_lossless_compression
 from scl.utils.misc_utils import cache
 import time
 from tqdm import tqdm
-from os import scandir
+import copy
 from random import randint, seed
 # stats for graphs
 ENCODING_TIMES = []
@@ -101,8 +40,8 @@ class rANSParams:
 
     def __post_init__(self):
         ## define derived params
-        # M -> sum of frequencies
-        self.M = self.freqs.total_freq
+        # M -> power of 2
+        self.M = 2**16
 
         # the state always lies in the range [L,H]
         self.L = self.RANGE_FACTOR * self.M
@@ -139,15 +78,51 @@ class rANSEncoder(DataEncoder):
             rans_params (rANSParams): global rANS hyperparameters
         """
         self.params = rans_params
+        # initialize this to just be the first symbol, which shouldn't matter in the long run
+        self.prev_symbol = self.params.freqs.alphabet[0][0]
+        self.true_freqs = copy.deepcopy(self.params.freqs)
+
+    def update_internals(self):
+        ratio = self.params.M / self.true_freqs.total_freq
+        rounded_freqs = {}
+        for s in self.params.freqs.alphabet:
+            f = self.true_freqs.freq_dict[s]
+            new_f = f * ratio
+            rounded_freqs[s] = round(new_f)
+        # make sure the rounded_freqs adds up to M, so we just add or subtract 1 randomly until they do
+        i = 0
+        while (sum(rounded_freqs.values())) > self.params.M:
+            rounded_freqs[list(rounded_freqs.keys())[i]] -= 1
+            i += 1
+        while (sum(rounded_freqs.values())) < self.params.M:
+            rounded_freqs[list(rounded_freqs.keys())[i % len(rounded_freqs)]] += 1
+            i += 1
+        # replace passed in freqs with our rounded_freqs
+        self.params.freqs = Frequencies(rounded_freqs)
+        # END MY CODE
+
+        # the state always lies in the range [L,H]
+        self.params.L = self.params.RANGE_FACTOR * self.params.M
+        self.params.H = self.params.L * (1 << self.params.NUM_BITS_OUT) - 1
+
+        # define min max range for shrunk_state (useful during encoding)
+        self.params.min_shrunk_state = {}
+        self.params.max_shrunk_state = {}
+        for s in self.params.freqs.alphabet:
+            f = self.params.freqs.frequency(s)
+            self.params.min_shrunk_state[s] = self.params.RANGE_FACTOR * f
+            self.params.max_shrunk_state[s] = self.params.RANGE_FACTOR * f * (1 << self.params.NUM_BITS_OUT) - 1
 
     def rans_base_encode_step(self, s, state: int):
         """base rANS encode step
 
         updates the state based on the input symbols s, and returns the updated state
         """
-        f = self.params.freqs.frequency(s)
+        # ADDED self.prev_symbol because our alphabet is 2 tuples not 1 symbol
+        two_tuple = self.prev_symbol + s
+        f = self.params.freqs.frequency(two_tuple)
         block_id = state // f
-        slot = self.params.freqs.cumulative_freq_dict[s] + (state % f)
+        slot = self.params.freqs.cumulative_freq_dict[two_tuple] + (state % f)
         next_state = block_id * self.params.M + slot
         return next_state
 
@@ -156,7 +131,8 @@ class rANSEncoder(DataEncoder):
         out_bits = BitArray("")
 
         # output bits to the stream to bring the state in the range for the next encoding
-        while state > self.params.max_shrunk_state[next_symbol]:
+        # ADDED self.prev_symbol inside the subscript because our list is different
+        while state > self.params.max_shrunk_state[self.prev_symbol + next_symbol]:
             _bits = uint_to_bitarray(
                 state % (1 << self.params.NUM_BITS_OUT), bit_width=self.params.NUM_BITS_OUT
             )
@@ -196,12 +172,26 @@ class rANSEncoder(DataEncoder):
 
         # initialize the state
         state = self.params.INITIAL_STATE
-
-        # update the state
-        for s in tqdm(data_block.data_list):
+        # go forward, and build the freq_array
+        for i, s in enumerate(data_block.data_list):
+            curr_tuple = self.prev_symbol + s
+            self.true_freqs.freq_dict[curr_tuple] += 1
+            self.prev_symbol = s
+        self.prev_symbol = data_block.data_list[-2]
+        self.update_internals()
+        # update the state, but going backwards
+        backwards_data_block = DataBlock(list(reversed(data_block.data_list)))
+        for i, s in tqdm(enumerate(backwards_data_block.data_list)):
+            # get rid of the context because we are encoding backwards
+            self.true_freqs.freq_dict[self.prev_symbol+s] -= 1
+            self.update_internals()
             state, symbol_bitarray = self.encode_symbol(s, state)
+            # tracking previous symbol
+            if i < (len(backwards_data_block.data_list) - 2):
+                self.prev_symbol = backwards_data_block.data_list[i+2]
+            else:
+                self.prev_symbol = self.params.freqs.alphabet[0][0]
             encoded_bitarray = symbol_bitarray + encoded_bitarray
-
         # Finally, pre-pend binary representation of the final state
         encoded_bitarray = uint_to_bitarray(state, self.params.NUM_STATE_BITS) + encoded_bitarray
 
@@ -213,7 +203,7 @@ class rANSEncoder(DataEncoder):
         encoded_bitarray = (
             uint_to_bitarray(data_block.size, self.params.DATA_BLOCK_SIZE_BITS) + encoded_bitarray
         )
-        end_time = time.time()-t
+        end_time = time.time() - t
         print(f"End Encoding: {end_time}")
         ENCODING_TIMES.append(end_time)
         return encoded_bitarray
@@ -222,6 +212,8 @@ class rANSEncoder(DataEncoder):
 class rANSDecoder(DataDecoder):
     def __init__(self, rans_params: rANSParams):
         self.params = rans_params
+        self.prev_symbol = self.params.freqs.alphabet[0][0]
+        self.true_freqs = copy.deepcopy(self.params.freqs)
 
     @staticmethod
     def find_bin(cumulative_freqs_list: List, slot: int) -> int:
@@ -240,7 +232,39 @@ class rANSDecoder(DataDecoder):
         bin = np.searchsorted(cumulative_freqs_list, slot, side="right") - 1
         return int(bin)
 
+    def update_internals(self):
+        ratio = self.params.M / self.true_freqs.total_freq
+        rounded_freqs = {}
+        for s in self.params.freqs.alphabet:
+            f = self.true_freqs.freq_dict[s]
+            new_f = f * ratio
+            rounded_freqs[s] = round(new_f)
+        # make sure the rounded_freqs adds up to M, so we just add or subtract 1 randomly until they do
+        i = 0
+        while (sum(rounded_freqs.values())) > self.params.M:
+            rounded_freqs[list(rounded_freqs.keys())[i]] -= 1
+            i += 1
+        while (sum(rounded_freqs.values())) < self.params.M:
+            rounded_freqs[list(rounded_freqs.keys())[i % len(rounded_freqs)]] += 1
+            i += 1
+        # replace passed in freqs with our rounded_freqs
+        self.params.freqs = Frequencies(rounded_freqs)
+        # END MY CODE
+
+        # the state always lies in the range [L,H]
+        self.params.L = self.params.RANGE_FACTOR * self.params.M
+        self.params.H = self.params.L * (1 << self.params.NUM_BITS_OUT) - 1
+
+        # define min max range for shrunk_state (useful during encoding)
+        self.params.min_shrunk_state = {}
+        self.params.max_shrunk_state = {}
+        for s in self.params.freqs.alphabet:
+            f = self.params.freqs.frequency(s)
+            self.params.min_shrunk_state[s] = self.params.RANGE_FACTOR * f
+            self.params.max_shrunk_state[s] = self.params.RANGE_FACTOR * f * (1 << self.params.NUM_BITS_OUT) - 1
+
     def rans_base_decode_step(self, state: int):
+
         block_id = state // self.params.M
         slot = state % self.params.M
 
@@ -248,14 +272,17 @@ class rANSDecoder(DataDecoder):
         cum_prob_list = list(self.params.freqs.cumulative_freq_dict.values())
         symbol_ind = self.find_bin(cum_prob_list, slot)
         s = self.params.freqs.alphabet[symbol_ind]
-
         # retrieve prev state
         prev_state = (
             block_id * self.params.freqs.frequency(s)
             + slot
             - self.params.freqs.cumulative_freq_dict[s]
         )
-        return s, prev_state
+        # update the markov params
+        self.true_freqs.freq_dict[s] += 1
+        self.prev_symbol = s[-1]
+        self.update_internals()
+        return s[-1], prev_state
 
     def expand_state(self, state: int, encoded_bitarray: BitArray) -> Tuple[int, int]:
         # remap the state into the acceptable range
@@ -279,6 +306,7 @@ class rANSDecoder(DataDecoder):
     def decode_block(self, encoded_bitarray: BitArray):
         print("Start Decoding")
         t = time.time()
+        self.update_internals()
         # get data block size
         data_block_size_bitarray = encoded_bitarray[: self.params.DATA_BLOCK_SIZE_BITS]
         input_data_block_size = bitarray_to_uint(data_block_size_bitarray)
@@ -296,10 +324,8 @@ class rANSDecoder(DataDecoder):
             s, state, num_symbol_bits = self.decode_symbol(
                 state, encoded_bitarray[num_bits_consumed:]
             )
-
-            # rANS decoder decodes symbols in the reverse direction,
-            # so we add newly decoded symbol at the beginning
-            decoded_data_list = [s] + decoded_data_list
+            # markov_rANS decoder decodes from beginning to end, so add newly decoded symbol to end of list
+            decoded_data_list.append(s)
             num_bits_consumed += num_symbol_bits
 
         # Finally, as a sanity check, ensure that the end state should be equal to the initial state
@@ -312,141 +338,6 @@ class rANSDecoder(DataDecoder):
 
 ######################################## TESTS ##########################################
 
-
-def test_check_encoded_bitarray():
-    # test a specific example to check if the bitstream is as expected
-    freq = Frequencies({"A": 3, "B": 3, "C": 2})
-    data = DataBlock(["A", "C", "B"])
-    params = rANSParams(freq, DATA_BLOCK_SIZE_BITS=5, NUM_BITS_OUT=1, RANGE_FACTOR=1)
-
-    # NOTE: the encoded_bitstream looks like = [<data_size_bits>, <final_state_bits>,<s_n-1_bits>, <s_n-2_bits>, ..., <s0_bits>]
-    # as the bits for symbols are prepended.
-    ## Lets manually encode to find intermediate state etc:
-    M = 8  # freq.total_freq
-    L = 8  # = Mt
-    H = 15  # = 2Mt-1
-
-    expected_encoded_bitarray = BitArray("")
-
-    # lets start with defining the initial_state
-    x = 8
-    assert params.INITIAL_STATE == 8
-
-    ## encode symbol 1 = A
-    # step-1: shrink state x to be in [3, 5]
-    x = 4  # x = x//2
-    expected_encoded_bitarray = BitArray("0") + expected_encoded_bitarray
-
-    # step-2: rANS base encoding step
-    x = 9  # x = (x//3)*8 + 0 + (x%3)
-
-    ## encode symbol 2 = C
-    # step-1: shrink state x to be in [2, 3]
-    x = 2  # x = x//4
-    expected_encoded_bitarray = BitArray("01") + expected_encoded_bitarray
-
-    # step-2: rANS base encoding step
-    x = 14  # x = (x//2)*8 + 6 + (x%2)
-
-    ## encode symbol 3 = B
-    # step-1: shrink state x to be in [3, 5]
-    x = 3  # x = x//4
-    expected_encoded_bitarray = BitArray("10") + expected_encoded_bitarray
-
-    # step-2: rANS base encoding step
-    x = 11  # x = (x//3)*8 + 3 + (x%3)
-
-    ## prepnd the final state to the bitarray
-    num_state_bits = 4  # log2(15)
-    assert params.NUM_STATE_BITS == num_state_bits
-    expected_encoded_bitarray = BitArray("1011") + expected_encoded_bitarray
-
-    # append number of symbols = 3 using params.DATA_BLOCK_SIZE_BITS
-    expected_encoded_bitarray = BitArray("00011") + expected_encoded_bitarray
-
-    ################################
-
-    ## Now lets encode using the encode_block and see it the result matches
-    encoder = rANSEncoder(params)
-    encoded_bitarray = encoder.encode_block(data)
-
-    assert expected_encoded_bitarray == encoded_bitarray
-
-
-def test_rANS_coding():
-    # List different distributions, rANS params to test
-    # trying out some random frequencies
-    freqs_list = [
-        Frequencies({"A": 1, "B": 1, "C": 2}),
-        Frequencies({"A": 12, "B": 34, "C": 1, "D": 45}),
-        Frequencies({"A": 34, "B": 35, "C": 546, "D": 1, "E": 13, "F": 245}),
-        Frequencies({"A": 5, "B": 5, "C": 5, "D": 5, "E": 5, "F": 5}),
-        Frequencies({"A": 1, "B": 3}),
-    ]
-    params_list = [
-        rANSParams(freqs_list[0]),
-        rANSParams(freqs_list[1]),
-        rANSParams(freqs_list[2], NUM_BITS_OUT=8),
-        rANSParams(freqs_list[3], RANGE_FACTOR=1 << 12),
-        rANSParams(freqs_list[4], RANGE_FACTOR=1 << 4),
-    ]
-
-    # generate random data and test if coding is lossless
-    DATA_SIZE = 20000
-    SEED = 0
-    for freq, rans_params in zip(freqs_list, params_list):
-        # generate random data
-        prob_dist = freq.get_prob_dist()
-        data_block = get_random_data_block(prob_dist, DATA_SIZE, seed=SEED)
-        avg_log_prob = get_avg_neg_log_prob(prob_dist, data_block)
-
-        # create encoder decoder
-        encoder = rANSEncoder(rans_params)
-        decoder = rANSDecoder(rans_params)
-
-        # test lossless coding
-        is_lossless, encode_len, _ = try_lossless_compression(
-            data_block, encoder, decoder, add_extra_bits_to_encoder_output=True
-        )
-        assert is_lossless
-        # avg codelen ignoring the bits used to signal num data elements
-        avg_codelen = encode_len / data_block.size
-        print(f"rANS coding: avg_log_prob={avg_log_prob:.3f}, rANS codelen: {avg_codelen:.3f}")
-
-
-def test_alias_rANS_coding():
-    """
-    Function to compare runtimes/compression performance against alias rANS implementation
-    """
-    files = []
-    with scandir("project_data") as folder:
-        for entry in folder:
-            files.append(entry.name)
-    files.sort()
-
-    for i, f in enumerate(files):
-        with open("project_data/" + f, "r") as file:
-            print("Book:", f.replace("_", " ")[:-10].title())
-            data = file.read()
-            data_list = [i for i in data]
-            data_block = DataBlock(data_list)
-            freqs = Frequencies(dict(sorted(data_block.get_counts().items())))
-            prob_dist = freqs.get_prob_dist()
-            avg_log_prob = get_avg_neg_log_prob(prob_dist, data_block)
-            # create encoder decoder
-            encoder = rANSEncoder(rANSParams(freqs))
-            decoder = rANSDecoder(rANSParams(freqs))
-
-            # test lossless coding
-            is_lossless, encode_len, _ = try_lossless_compression(
-                data_block, encoder, decoder, add_extra_bits_to_encoder_output=True
-            )
-            assert is_lossless
-            # avg codelen ignoring the bits used to signal num data elements
-            avg_codelen = encode_len / data_block.size
-            print(f"rANS coding: avg_log_prob={avg_log_prob:.3f}, rANS codelen: {avg_codelen:.3f}\n")
-
-
 def test_markov_rANS_coding():
     global ENCODING_TIMES
     global DECODING_TIMES
@@ -454,6 +345,7 @@ def test_markov_rANS_coding():
     SEED = 0
     # set the seed for the tests
     seed(274)
+    # stats for graphs
     empirical_entropies, codelens = {data_size: [] for data_size in data_sizes}, {data_size: [] for data_size in data_sizes}
     encoding_times, decoding_times = {data_size: [] for data_size in data_sizes}, {data_size: [] for data_size in data_sizes}
     for DATA_SIZE in data_sizes:
@@ -478,19 +370,31 @@ def test_markov_rANS_coding():
                 true_data_list.append(two_tuple[1])
             data_block = DataBlock(true_data_list)
 
-            # re-create frequencies, to make them for the 1-symbol alphabet
-            freqs = Frequencies({symbol: data_block.data_list.count(symbol) for symbol in alphabet})
-            # # below is equivalent to just gettng avg_log_prob
-            # empirical_entropy = 0
-            # for key in freqs.freq_dict:
-            #     prob = freqs.freq_dict[key] / (2 * DATA_SIZE)
-            #     empirical_entropy += prob * np.log2(1/prob)
+            # measure empirical entropy
+            all_2_tuples = []
+            # skip last symbol
+            for i in range(len(true_data_list) - 1):
+                all_2_tuples.append(true_data_list[i]+true_data_list[i+1])
 
-            prob_dist = freqs.get_prob_dist()
-            avg_log_prob = get_avg_neg_log_prob(prob_dist, data_block)
-            # start with complete knowledge of frequencies
-            encoder = rANSEncoder(rANSParams(freqs))
-            decoder = rANSDecoder(rANSParams(freqs))
+            all_counts = {key: 0 for key in dct.keys()}
+            for two_tuple in all_2_tuples:
+                all_counts[two_tuple] += 1
+            sum_counts = sum(all_counts.values())
+
+            # formula for empirical entropy from class
+            empirical_entropy = 0
+            for key in all_counts:
+                prob = all_counts[key] / sum_counts
+                empirical_entropy += prob * np.log2(1/prob)
+
+            # start with no knowledge of the frequencies (uniform distribution)
+            uniform_freqs = {}
+            for symbol_1 in alphabet:
+                for symbol_2 in alphabet:
+                    uniform_freqs[symbol_1 + symbol_2] = 1
+            uniform_freqs = Frequencies(uniform_freqs)
+            encoder = rANSEncoder(rANSParams(uniform_freqs))
+            decoder = rANSDecoder(rANSParams(uniform_freqs))
 
             # test lossless coding
             is_lossless, encode_len, _ = try_lossless_compression(
@@ -499,8 +403,9 @@ def test_markov_rANS_coding():
             assert is_lossless
             # avg codelen ignoring the bits used to signal num data elements
             avg_codelen = encode_len / data_block.size
-            print(f"rANS coding: empirical entropy={avg_log_prob:.3f}, rANS codelen: {avg_codelen:.3f}")
-            empirical_entropies[DATA_SIZE].append(avg_log_prob)
+            print(f"markov_rANS coding: empirical entropy={empirical_entropy:.3f}, markov_rANS codelen: {avg_codelen:.3f}")
+            # stats for graphs
+            empirical_entropies[DATA_SIZE].append(empirical_entropy)
             codelens[DATA_SIZE].append(avg_codelen)
             encoding_times[DATA_SIZE] += ENCODING_TIMES
             ENCODING_TIMES = []
@@ -514,6 +419,9 @@ def test_markov_rANS_coding():
         empirical_entropies_averages.append(np.mean(empirical_entropies[data_size]))
         codelens_averages.append(np.mean(codelens[data_size]))
 
-    with open("data_standard.txt", "w") as f:
+    with open("data_markov.txt", "w") as f:
         f.write(f"{encoding_averages}\n{decoding_averages}\n{empirical_entropies_averages}\n{codelens_averages}\n")
     return encoding_averages, decoding_averages, empirical_entropies_averages, codelens_averages
+
+
+# test_markov_rANS_coding()

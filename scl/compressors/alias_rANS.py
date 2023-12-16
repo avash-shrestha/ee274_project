@@ -1,64 +1,3 @@
-"""Streaming rANS (range Asymmetric Numeral Systems) implementation
-
-NOTE: Detailed algorithm description and discussion is on the wiki page:
-https://github.com/kedartatwawadi/stanford_compression_library/wiki/Asymmetric-Numeral-Systems
-
-## Core idea
-- the theoretical rANS Encoder maintains an integer `state` 
-- For each symbol s, the state is updated by calling: 
-    ```python
-    # encode step
-    state = rans_base_encode_step(s, state)
-    ```
-    the decoder does the reverse by decoding the s and retrieving the prev state
-    ```python
-    # decode step
-    s, state = rans_base_decode_step(state)
-    ```
-- In the theoretical rANS version, the state keeps on increasing every time we call `rans_base_encode_step`
-  To make this practical, the rANS encoder ensures that after each encode step, the `state` lies in the acceptable range
-  `[L, H]`, where `L,H` are predefined interval values.
-
-  ```
-  state lies in [L, H], after every encode step
-  ```
-  To ensure this happens the encoder shrinks the `state` by streaming out its lower bits, *before* encoding each symbol. 
-  This logic is implemented in the function `shrink_state`. Thus, the full encoding step for one symbol is as follows:
-
-  ```python
-    ## Encoding one symbol
-    # output bits to the stream to bring the state in the range for the next encoding
-        state, out_bits = self.shrink_state(state, s)
-        encoded_bitarray = out_bits + encoded_bitarray
-
-    # core encoding step
-    state = self.rans_base_encode_step(s, state)
-  ```
-
-  The decoder does the reverse operation of `expand_state` where, after decoding a symbol, it reads in the a few bits to
-  re-map and expand the state to lie within the acceptable range [L, H]
-  Note that `shrink_state` and `expand_state` are inverses of each other
-
-  Thus, the  full decoding step 
-  ```python
-    # base rANS decoding step
-    s, state = self.rans_base_decode_step(state)
-
-    # remap the state into the acceptable range
-    state, num_bits_used_by_expand_state = self.expand_state(state, encoded_bitarray)
-  ```
-- For completeness: the acceptable range `[L, H]` are given by:
-  L = RANGE_FACTOR*total_freq
-  H = (2**NUM_BITS_OUT)*RANGE_FACTOR*total_freq - 1)
-  Why specifically these values? Look at the *Streaming-rANS* section on https://kedartatwawadi.github.io/post--ANS/
-
-
-## References
-1. Original Asymmetric Numeral Systems paper:  https://arxiv.org/abs/0902.0271
-2. https://github.com/kedartatwawadi/stanford_compression_library/wiki/Asymmetric-Numeral-Systems
-More references in the wiki article
-"""
-
 from dataclasses import dataclass
 import numpy as np
 from typing import Tuple, Any, List
@@ -73,11 +12,11 @@ from scl.core.data_block import DataBlock
 from scl.core.prob_dist import Frequencies, get_avg_neg_log_prob
 from scl.utils.test_utils import get_random_data_block, try_lossless_compression
 from scl.utils.misc_utils import cache
+from collections import deque  # deque for alias worklists (small and large)
+from random import randint, seed
 import time
 from tqdm import tqdm
 from os import scandir
-from random import randint, seed
-# stats for graphs
 ENCODING_TIMES = []
 DECODING_TIMES = []
 @dataclass
@@ -98,16 +37,32 @@ class rANSParams:
     # rANS state is limited to the range [RANGE_FACTOR*total_freq, (2**NUM_BITS_OUT)*RANGE_FACTOR*total_freq - 1)]
     # RANGE_FACTOR is a base parameter controlling this range
     RANGE_FACTOR: int = 1 << 16
-
     def __post_init__(self):
         ## define derived params
-        # M -> sum of frequencies
-        self.M = self.freqs.total_freq
+        # make M a power of two
+        self.M = 2**32
+        # so, we need to adjust the frequencies accordingly
+        ratio = self.M / self.freqs.total_freq
+        rounded_freqs = {}
+        for s in self.freqs.alphabet:
+            f = self.freqs.frequency(s)
+            new_f = f * ratio
+            rounded_freqs[s] = round(new_f)
+
+        # make sure the rounded_freqs adds up to M, so we just add or subtract 1 randomly until they do
+        i = 0
+        while (sum(rounded_freqs.values())) > self.M:
+            rounded_freqs[list(rounded_freqs.keys())[i]] -= 1
+            i += 1
+        while (sum(rounded_freqs.values())) < self.M:
+            rounded_freqs[list(rounded_freqs.keys())[i % len(rounded_freqs)]] += 1
+            i += 1
+        # replace passed in freqs with our rounded_freqs
+        self.freqs = Frequencies(rounded_freqs)
 
         # the state always lies in the range [L,H]
         self.L = self.RANGE_FACTOR * self.M
         self.H = self.L * (1 << self.NUM_BITS_OUT) - 1
-
         # define min max range for shrunk_state (useful during encoding)
         self.min_shrunk_state = {}
         self.max_shrunk_state = {}
@@ -139,6 +94,76 @@ class rANSEncoder(DataEncoder):
             rans_params (rANSParams): global rANS hyperparameters
         """
         self.params = rans_params
+        # keep track of symbols and indices
+        self.symbols_to_numbers_dict = {}
+        # n is the power of 2 closest to the true n (from above)
+        self.n = int(2**np.ceil(np.log2(len(self.params.freqs.alphabet))))
+        self.k = self.params.M / self.n
+        self.alias_table = [0] * self.n
+        self.prob_table = [0] * self.n
+        self.slot_locations = {i: {} for i in range(self.n)}
+        self.primary_start = []
+        self.alias_start = []
+
+    def alias_tables(self):
+        # Credit to Keith Schwarz's blogpost/pseudocode for Alias Tables
+        # https://www.keithschwarz.com/darts-dice-coins/
+        small, large = deque(), deque()
+        freqs_dict = {}
+
+        for i, s in enumerate(self.params.freqs.alphabet):
+            freqs_dict[s] = self.params.freqs.frequency(s)
+            self.symbols_to_numbers_dict[s] = i
+
+        # create dummy variables in order to make len(freqs_dict) = self.n, a power of 2
+        num_dummies = self.n - len(self.params.freqs.alphabet)
+        for i in range(num_dummies):
+            freqs_dict["DUMMY_" + str(i)] = 0
+            self.symbols_to_numbers_dict["DUMMY_" + str(i)] = i + len(self.params.freqs.alphabet)
+        # sum of values in scaled_prob should be n * 1, since 1 is the sum of probability space (duh)
+        scaled_probs = {}
+        for freq in freqs_dict:
+            scaled_probs[freq] = (freqs_dict[freq] / self.params.M) * self.n
+        # add to small or large
+        for symbol in scaled_probs:
+            if scaled_probs[symbol] < 1:
+                small.appendleft(symbol)
+            else:
+                large.appendleft(symbol)
+        while len(small) != 0 and len(large) != 0:
+            l = small.popleft()
+            g = large.popleft()
+            # convert l (a symbol) to its equivalent numerical representation using self.symbols_to_numbers_dict
+            self.prob_table[self.symbols_to_numbers_dict[l]] = scaled_probs[l]
+            self.alias_table[self.symbols_to_numbers_dict[l]] = g
+            # changing value of p_g to account for probability mass we used
+            scaled_probs[g] = (scaled_probs[g] + scaled_probs[l]) - 1
+            if scaled_probs[g] < 1:
+                small.appendleft(g)
+            else:
+                large.appendleft(g)
+
+        while len(large) != 0:
+            g = large.popleft()
+            self.prob_table[self.symbols_to_numbers_dict[g]] = 1
+
+        while len(small) != 0:
+            l = small.popleft()
+            self.prob_table[self.symbols_to_numbers_dict[l]] = 1
+
+        # construct self.slot_locations
+        for i in range(len(self.prob_table)):
+            if self.prob_table[i] == 1:
+                self.slot_locations[i][i] = self.k
+            else:
+                self.slot_locations[i][i] = self.prob_table[i] * self.k
+                self.slot_locations[self.symbols_to_numbers_dict[self.alias_table[i]]][i] = self.k - self.slot_locations[i][i]
+
+        # construct primary_start and alias_start
+        for i in range(len(self.prob_table)):
+            self.primary_start.append(self.k * i)
+            self.alias_start.append(self.k * i + self.prob_table[i] * self.k)
+
 
     def rans_base_encode_step(self, s, state: int):
         """base rANS encode step
@@ -147,9 +172,24 @@ class rANSEncoder(DataEncoder):
         """
         f = self.params.freqs.frequency(s)
         block_id = state // f
-        slot = self.params.freqs.cumulative_freq_dict[s] + (state % f)
-        next_state = block_id * self.params.M + slot
-        return next_state
+        rem = state % f
+        isAlias = False
+        for i in self.slot_locations[self.symbols_to_numbers_dict[s]]:
+            if self.slot_locations[self.symbols_to_numbers_dict[s]][i] > rem:
+                slot_id = i
+                # if we are not in the true spot of the symbol (i.e. the symbol is the alias)
+                if i != self.symbols_to_numbers_dict[s]:
+                    isAlias = True
+                break
+            else:
+                rem -= self.slot_locations[self.symbols_to_numbers_dict[s]][i]
+        next_state = block_id * self.params.M + rem
+        if not isAlias:
+            next_state += self.primary_start[slot_id]
+        else:
+            next_state += self.alias_start[slot_id]
+        return int(next_state)
+
 
     def shrink_state(self, state: int, next_symbol) -> Tuple[int, BitArray]:
         """stream out the lower bits of the state, until the state is below params.max_shrunk_state[next_symbol]"""
@@ -191,6 +231,9 @@ class rANSEncoder(DataEncoder):
     def encode_block(self, data_block: DataBlock):
         print("Start Encoding")
         t = time.time()
+        # initialize all the data structures needed for alias method
+        self.alias_tables()
+
         # initialize the output
         encoded_bitarray = BitArray("")
 
@@ -213,7 +256,7 @@ class rANSEncoder(DataEncoder):
         encoded_bitarray = (
             uint_to_bitarray(data_block.size, self.params.DATA_BLOCK_SIZE_BITS) + encoded_bitarray
         )
-        end_time = time.time()-t
+        end_time = time.time() - t
         print(f"End Encoding: {end_time}")
         ENCODING_TIMES.append(end_time)
         return encoded_bitarray
@@ -222,40 +265,97 @@ class rANSEncoder(DataEncoder):
 class rANSDecoder(DataDecoder):
     def __init__(self, rans_params: rANSParams):
         self.params = rans_params
+        self.symbols_to_numbers_dict = {}
+        # n is the power of 2 closest to the true n (from above)
+        self.n = int(2 ** np.ceil(np.log2(len(self.params.freqs.alphabet))))
+        # self.n = len(self.params.freqs.alphabet)
+        self.k = self.params.M / self.n
+        self.alias_table = [0] * self.n
+        self.prob_table = [0] * self.n
+        self.slot_locations = {i: {} for i in range(self.n)}
+        self.primary_start = []
+        self.alias_start = []
+        # use cumul dict so that we don't iterate through slot_positions in the base decode step
+        self.symbol_cumul = {i: [] for i in range(self.n)}
 
-    @staticmethod
-    def find_bin(cumulative_freqs_list: List, slot: int) -> int:
-        """Performs binary search over cumulative_freqs_list to locate which bin
-        the slot lies.
+    def alias_tables(self):
+        # CREDIT KEITH SCHWARZ'S POST/PSEUDOCODE
+        small, large = deque(), deque()
+        freqs_dict = {}
 
-        Args:
-            cumulative_freqs_list (List): the sorted list of cumulative frequencies
-                For example: freqs_list = [2,7,3], cumulative_freqs_list [0,2,9]
-            slot (int): the value to search in the sorted list
+        for i, s in enumerate(self.params.freqs.alphabet):
+            freqs_dict[s] = self.params.freqs.frequency(s)
+            self.symbols_to_numbers_dict[s] = i
 
-        Returns:
-            bin: the bin in which the slot lies
-        """
-        # NOTE: side="right" corresponds to search of type a[i-1] <= t < a[i]
-        bin = np.searchsorted(cumulative_freqs_list, slot, side="right") - 1
-        return int(bin)
+        # create dummy variables in order to make len(freqs_dict) = self.n, a power of 2
+        num_dummies = self.n - len(self.params.freqs.alphabet)
+        for i in range(num_dummies):
+            freqs_dict["DUMMY_" + str(i)] = 0
+            self.symbols_to_numbers_dict["DUMMY_" + str(i)] = i + len(self.params.freqs.alphabet)
+        # sum of values in scaled_prob should be n * 1, since 1 is the sum of probability space (duh)
+        scaled_probs = {}
+        for freq in freqs_dict:
+            scaled_probs[freq] = (freqs_dict[freq] / self.params.M) * self.n
+        # add to small or large
+        for symbol in scaled_probs:
+            if scaled_probs[symbol] < 1:
+                small.appendleft(symbol)
+            else:
+                large.appendleft(symbol)
+        while len(small) != 0 and len(large) != 0:
+            l = small.popleft()
+            g = large.popleft()
+            # convert l (a symbol) to its equivalent numerical representation using self.symbols_to_numbers_dict
+            self.prob_table[self.symbols_to_numbers_dict[l]] = scaled_probs[l]
+            self.alias_table[self.symbols_to_numbers_dict[l]] = g
+            # changing value of p_g to account for probability mass we used
+            scaled_probs[g] = (scaled_probs[g] + scaled_probs[l]) - 1
+            if scaled_probs[g] < 1:
+                small.appendleft(g)
+            else:
+                large.appendleft(g)
+
+        while len(large) != 0:
+            g = large.popleft()
+            self.prob_table[self.symbols_to_numbers_dict[g]] = 1
+
+        while len(small) != 0:
+            l = small.popleft()
+            self.prob_table[self.symbols_to_numbers_dict[l]] = 1
+
+        # construct self.slot_locations
+        for i in range(len(self.prob_table)):
+            if self.prob_table[i] == 1:
+                self.slot_locations[i][i] = self.k
+            else:
+                self.slot_locations[i][i] = self.prob_table[i] * self.k
+                self.slot_locations[self.symbols_to_numbers_dict[self.alias_table[i]]][i] = self.k - self.slot_locations[i][i]
+
+        for i in range(len(self.prob_table)):
+            self.primary_start.append(self.k * i)
+            self.alias_start.append(self.k * i + self.prob_table[i] * self.k)
+            cumul = 0
+            for j in range(len(self.slot_locations)):
+                self.symbol_cumul[i].append(cumul)
+                if j in self.slot_locations[i]:
+                    cumul += self.slot_locations[i][j]
+
 
     def rans_base_decode_step(self, state: int):
-        block_id = state // self.params.M
-        slot = state % self.params.M
-
-        # decode symbol
-        cum_prob_list = list(self.params.freqs.cumulative_freq_dict.values())
-        symbol_ind = self.find_bin(cum_prob_list, slot)
-        s = self.params.freqs.alphabet[symbol_ind]
-
-        # retrieve prev state
-        prev_state = (
-            block_id * self.params.freqs.frequency(s)
-            + slot
-            - self.params.freqs.cumulative_freq_dict[s]
-        )
-        return s, prev_state
+        xM = state % self.params.M
+        bucket_id = int(xM / self.k)
+        # true symbol
+        if (xM % self.k) < (self.prob_table[bucket_id] * self.k):
+            symbol = self.params.freqs.alphabet[bucket_id]
+            bias = self.primary_start[bucket_id]
+        else:
+            # alias symbol
+            symbol = self.alias_table[bucket_id]
+            bias = self.alias_start[bucket_id]
+        # this is to make sure that the bias term actually == x_prev % freq[s], since the "cumul" array is no longer contiguous
+        bias -= self.symbol_cumul[self.symbols_to_numbers_dict[symbol]][bucket_id]
+        x_prev = ((state // self.params.M) * self.params.freqs.frequency(symbol)) + xM - bias
+        return symbol, int(x_prev)
 
     def expand_state(self, state: int, encoded_bitarray: BitArray) -> Tuple[int, int]:
         # remap the state into the acceptable range
@@ -279,6 +379,9 @@ class rANSDecoder(DataDecoder):
     def decode_block(self, encoded_bitarray: BitArray):
         print("Start Decoding")
         t = time.time()
+        # initialize all the tables needed for alias method
+        self.alias_tables()
+
         # get data block size
         data_block_size_bitarray = encoded_bitarray[: self.params.DATA_BLOCK_SIZE_BITS]
         input_data_block_size = bitarray_to_uint(data_block_size_bitarray)
@@ -306,91 +409,24 @@ class rANSDecoder(DataDecoder):
         assert state == self.params.INITIAL_STATE
         end_time = time.time() - t
         print(f"End Decoding: {end_time}")
-        DECODING_TIMES.append(end_time)
+        DECODING_TIMES.append((end_time))
         return DataBlock(decoded_data_list), num_bits_consumed
 
 
 ######################################## TESTS ##########################################
 
-
-def test_check_encoded_bitarray():
-    # test a specific example to check if the bitstream is as expected
-    freq = Frequencies({"A": 3, "B": 3, "C": 2})
-    data = DataBlock(["A", "C", "B"])
-    params = rANSParams(freq, DATA_BLOCK_SIZE_BITS=5, NUM_BITS_OUT=1, RANGE_FACTOR=1)
-
-    # NOTE: the encoded_bitstream looks like = [<data_size_bits>, <final_state_bits>,<s_n-1_bits>, <s_n-2_bits>, ..., <s0_bits>]
-    # as the bits for symbols are prepended.
-    ## Lets manually encode to find intermediate state etc:
-    M = 8  # freq.total_freq
-    L = 8  # = Mt
-    H = 15  # = 2Mt-1
-
-    expected_encoded_bitarray = BitArray("")
-
-    # lets start with defining the initial_state
-    x = 8
-    assert params.INITIAL_STATE == 8
-
-    ## encode symbol 1 = A
-    # step-1: shrink state x to be in [3, 5]
-    x = 4  # x = x//2
-    expected_encoded_bitarray = BitArray("0") + expected_encoded_bitarray
-
-    # step-2: rANS base encoding step
-    x = 9  # x = (x//3)*8 + 0 + (x%3)
-
-    ## encode symbol 2 = C
-    # step-1: shrink state x to be in [2, 3]
-    x = 2  # x = x//4
-    expected_encoded_bitarray = BitArray("01") + expected_encoded_bitarray
-
-    # step-2: rANS base encoding step
-    x = 14  # x = (x//2)*8 + 6 + (x%2)
-
-    ## encode symbol 3 = B
-    # step-1: shrink state x to be in [3, 5]
-    x = 3  # x = x//4
-    expected_encoded_bitarray = BitArray("10") + expected_encoded_bitarray
-
-    # step-2: rANS base encoding step
-    x = 11  # x = (x//3)*8 + 3 + (x%3)
-
-    ## prepnd the final state to the bitarray
-    num_state_bits = 4  # log2(15)
-    assert params.NUM_STATE_BITS == num_state_bits
-    expected_encoded_bitarray = BitArray("1011") + expected_encoded_bitarray
-
-    # append number of symbols = 3 using params.DATA_BLOCK_SIZE_BITS
-    expected_encoded_bitarray = BitArray("00011") + expected_encoded_bitarray
-
-    ################################
-
-    ## Now lets encode using the encode_block and see it the result matches
-    encoder = rANSEncoder(params)
-    encoded_bitarray = encoder.encode_block(data)
-
-    assert expected_encoded_bitarray == encoded_bitarray
-
-
 def test_rANS_coding():
-    # List different distributions, rANS params to test
+    ## List different distributions, rANS params to test
     # trying out some random frequencies
-    freqs_list = [
-        Frequencies({"A": 1, "B": 1, "C": 2}),
-        Frequencies({"A": 12, "B": 34, "C": 1, "D": 45}),
-        Frequencies({"A": 34, "B": 35, "C": 546, "D": 1, "E": 13, "F": 245}),
-        Frequencies({"A": 5, "B": 5, "C": 5, "D": 5, "E": 5, "F": 5}),
-        Frequencies({"A": 1, "B": 3}),
-    ]
-    params_list = [
-        rANSParams(freqs_list[0]),
-        rANSParams(freqs_list[1]),
-        rANSParams(freqs_list[2], NUM_BITS_OUT=8),
-        rANSParams(freqs_list[3], RANGE_FACTOR=1 << 12),
-        rANSParams(freqs_list[4], RANGE_FACTOR=1 << 4),
-    ]
-
+    dct = {}
+    for key in list(map(chr, range(97, 123))):
+        dct[key] = randint(1, 100)
+    freqs_list = [Frequencies({"A": 1, "B": 1, "C": 2}), Frequencies({"A": 12, "B": 34, "C": 1, "D": 45}),
+                  Frequencies({"A": 34, "B": 35, "C": 546, "D": 1, "E": 13, "F": 245}),
+                  Frequencies({"A": 5, "B": 5, "C": 5, "D": 5, "E": 5, "F": 5}), Frequencies({"A": 1, "B": 3}),
+                  Frequencies(dct)]
+    params_list = [rANSParams(freqs_list[0]), rANSParams(freqs_list[1]), rANSParams(freqs_list[2]),
+                   rANSParams(freqs_list[3]), rANSParams(freqs_list[4]), rANSParams(freqs_list[5])]
     # generate random data and test if coding is lossless
     DATA_SIZE = 20000
     SEED = 0
@@ -416,8 +452,8 @@ def test_rANS_coding():
 
 def test_alias_rANS_coding():
     """
-    Function to compare runtimes/compression performance against alias rANS implementation
-    """
+        Function to compare runtimes/compression performance against standard rANS implementation
+        """
     files = []
     with scandir("project_data") as folder:
         for entry in folder:
@@ -446,6 +482,8 @@ def test_alias_rANS_coding():
             avg_codelen = encode_len / data_block.size
             print(f"rANS coding: avg_log_prob={avg_log_prob:.3f}, rANS codelen: {avg_codelen:.3f}\n")
 
+
+test_alias_rANS_coding()
 
 def test_markov_rANS_coding():
     global ENCODING_TIMES
@@ -499,7 +537,7 @@ def test_markov_rANS_coding():
             assert is_lossless
             # avg codelen ignoring the bits used to signal num data elements
             avg_codelen = encode_len / data_block.size
-            print(f"rANS coding: empirical entropy={avg_log_prob:.3f}, rANS codelen: {avg_codelen:.3f}")
+            print(f"alias_rANS coding: empirical entropy={avg_log_prob:.3f}, alias_rANS codelen: {avg_codelen:.3f}")
             empirical_entropies[DATA_SIZE].append(avg_log_prob)
             codelens[DATA_SIZE].append(avg_codelen)
             encoding_times[DATA_SIZE] += ENCODING_TIMES
@@ -514,6 +552,8 @@ def test_markov_rANS_coding():
         empirical_entropies_averages.append(np.mean(empirical_entropies[data_size]))
         codelens_averages.append(np.mean(codelens[data_size]))
 
-    with open("data_standard.txt", "w") as f:
+    with open("data_updated_alias.txt", "w") as f:
         f.write(f"{encoding_averages}\n{decoding_averages}\n{empirical_entropies_averages}\n{codelens_averages}\n")
     return encoding_averages, decoding_averages, empirical_entropies_averages, codelens_averages
+
+
